@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"Mosaic Live Event Photo Experience"},{"path":"/admin","title":"Event control"},{"path":"/booth","title":"Photo Booth"},{"path":"/mosaic","title":"Live Mosaic"},{"path":"/gallery/:eventId","title":"Event gallery"}]}
