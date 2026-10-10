@@ -305,6 +305,7 @@ export default function MosaicPage() {
           animate={control.playing}
           branding={branding}
           maxPhotos={event.settings?.maxPhotos ?? 0}
+          logoUrl={event.logoUrl || defaultLogo}
           onArrivalEnd={finishArrival}
         />
       ) : (

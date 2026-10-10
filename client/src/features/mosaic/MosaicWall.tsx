@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import type { EventBranding, PhotoPayload } from "../../../../shared/mosaic";
 import { getVisibleTileCapacity } from "./mosaic-state";
+import { computeMaskedGrid } from "./image-mask";
 
 const EMPTY_TILES = Array.from({ length: 500 }, (_, index) => index);
 
@@ -19,10 +20,11 @@ interface MosaicWallProps {
   animate: boolean;
   branding: EventBranding;
   maxPhotos: number;
+  logoUrl: string;
   onArrivalEnd: () => void;
 }
 
-export default function MosaicWall({ photos, arrivalId, animate, branding, maxPhotos, onArrivalEnd }: MosaicWallProps) {
+export default function MosaicWall({ photos, arrivalId, animate, branding, maxPhotos, logoUrl, onArrivalEnd }: MosaicWallProps) {
   const wallRef = useRef<HTMLDivElement>(null);
   const [arrival, setArrival] = useState<ArrivalPosition | null>(null);
   const [tileCapacity, setTileCapacity] = useState(() =>
@@ -45,6 +47,21 @@ export default function MosaicWall({ photos, arrivalId, animate, branding, maxPh
       window.cancelAnimationFrame(frame);
     };
   }, [branding.tileGap, maxPhotos]);
+
+  const [maskData, setMaskData] = useState<{ cols: number; rows: number; solidIndices: number[] } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    if (maxPhotos > 0 && logoUrl) {
+      const aspectRatio = window.innerWidth / window.innerHeight;
+      computeMaskedGrid(logoUrl, maxPhotos, aspectRatio).then(data => {
+        if (active) setMaskData(data);
+      });
+    } else {
+      setMaskData(null);
+    }
+    return () => { active = false; };
+  }, [logoUrl, maxPhotos]);
 
   useLayoutEffect(() => {
     setArrival(null);
@@ -85,7 +102,11 @@ export default function MosaicWall({ photos, arrivalId, animate, branding, maxPh
       } as CSSProperties
     : undefined;
 
-  const gridStyle: CSSProperties | undefined = maxPhotos > 0 ? (() => {
+  const gridStyle: CSSProperties | undefined = maskData ? {
+    "--grid-cols": maskData.cols,
+    "--grid-rows": maskData.rows,
+    "--tile-size": "minmax(0, 1fr)"
+  } as CSSProperties : maxPhotos > 0 ? (() => {
     const rows = Math.round(Math.sqrt(tileCapacity * 9/16));
     const cols = Math.ceil(tileCapacity / Math.max(1, rows));
     return {
@@ -105,11 +126,35 @@ export default function MosaicWall({ photos, arrivalId, animate, branding, maxPh
     >
       {visiblePhotos.length === 0 ? (
         <div className="mosaic-empty-grid" aria-hidden="true" style={gridStyle}>
-          {EMPTY_TILES.map(index => <span key={index} />)}
+          {maskData ? (
+             Array.from({ length: maskData.cols * maskData.rows }).map((_, i) => (
+                <span key={i} style={maskData.solidIndices.includes(i) ? {} : { opacity: 0 }} />
+             ))
+          ) : EMPTY_TILES.map(index => <span key={index} />)}
         </div>
       ) : (
         <div className="mosaic-wall__grid" style={gridStyle}>
-          {visiblePhotos.map((photo, index) => (
+          {maskData ? Array.from({ length: maskData.cols * maskData.rows }).map((_, index) => {
+            const isSolid = maskData.solidIndices.includes(index);
+            if (!isSolid) {
+              return <div key={`empty-${index}`} className="mosaic-tile mosaic-tile--transparent" />;
+            }
+            const photoIndex = maskData.solidIndices.indexOf(index);
+            const photo = photos[photoIndex % photos.length];
+            if (!photo) return <div key={`empty-${index}`} className="mosaic-tile mosaic-tile--transparent" />;
+
+            return (
+              <div className={`mosaic-tile${arrivalId === photo.id && animate && arrival ? " mosaic-tile--arriving" : ""}`} key={`photo-${index}-${photo.id}`} data-photo-id={photo.id}>
+                <img
+                  src={photo.thumbnailUrl}
+                  alt=""
+                  loading={photoIndex < 24 ? "eager" : "lazy"}
+                  decoding="async"
+                  draggable={false}
+                />
+              </div>
+            );
+          }) : visiblePhotos.map((photo, index) => (
             <div className={`mosaic-tile${arrivalId === photo.id && animate && arrival ? " mosaic-tile--arriving" : ""}`} key={photo.id} data-photo-id={photo.id}>
               <img
                 src={photo.thumbnailUrl}
