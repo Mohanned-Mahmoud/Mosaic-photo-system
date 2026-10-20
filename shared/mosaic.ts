@@ -16,13 +16,20 @@ export const eventBrandingSchema = z
     tileGap: z.number().int().min(0).max(16),
     animationSpeed: z.enum(["calm", "cinematic", "energetic"]),
     logoPosition: z.enum(["center", "top-left", "top-right"]),
-    logoScale: z.number().int().min(30).max(100),
+    logoScale: z.number().int().min(10).max(100),
     logoAnimation: z.enum(["reveal", "none"]),
     theme: z.enum(["dark", "light"]),
+    logoDisplayMode: z.enum(["mask", "watermark", "inverted-mask", "letters"]).optional(),
+    lettersMode: z.enum(["strip", "letter", "grid", "dense"]).default("grid").optional(),
     watermarkOpacity: z.number().int().min(0).max(100),
     watermarkBlendMode: z.enum(["overlay", "multiply", "screen", "soft-light", "hard-light", "normal"]),
     watermarkScale: z.number().int().min(10).max(200),
     watermarkPosition: z.enum(["center", "top-left", "top-right", "bottom-left", "bottom-right"]),
+    maskCorners: z.array(z.number().min(0).max(1)).length(8).optional(),
+    targetLogos: z.array(z.string()).default([]),
+    autoAdvance: z.boolean().default(true),
+    autoAdvanceDelay: z.number().int().min(1).max(60).default(5),
+    arrivalHoldDuration: z.number().min(0.5).max(15).default(3).optional(),
   })
   .strict();
 
@@ -35,13 +42,19 @@ export const DEFAULT_BRANDING: EventBranding = {
   tileGap: 4,
   animationSpeed: "cinematic",
   logoPosition: "center",
-  logoScale: 72,
+  logoScale: 50,
   logoAnimation: "reveal",
   theme: "dark",
+  logoDisplayMode: "watermark",
+  lettersMode: "grid",
   watermarkOpacity: 60,
   watermarkBlendMode: "overlay",
   watermarkScale: 72,
   watermarkPosition: "center",
+  targetLogos: [],
+  autoAdvance: true,
+  autoAdvanceDelay: 5,
+  arrivalHoldDuration: 3,
 };
 
 export const eventSettingsSchema = z
@@ -105,6 +118,9 @@ export const mosaicControlSchema = z
     playing: z.boolean(),
     revision: z.number().int().nonnegative(),
     restartKey: z.number().int().nonnegative(),
+    autoFill: z.boolean().default(false),
+    screensaver: z.boolean().default(false),
+    targetIndex: z.number().int().nonnegative().default(0),
   })
   .strict();
 
@@ -124,7 +140,19 @@ export type MosaicSnapshot = z.infer<typeof mosaicSnapshotSchema>;
 export const eventControlInputSchema = z
   .object({
     eventId: eventIdSchema,
-    action: z.enum(["play", "pause", "restart", "clear", "reset"]),
+    action: z.enum([
+      "play",
+      "pause",
+      "restart",
+      "clear",
+      "reset",
+      "toggle-fill",
+      "toggle-screensaver",
+      "next-target",
+      "prev-target",
+      "set-target",
+    ]),
+    targetIndex: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -142,7 +170,8 @@ export const photoLookupInputSchema = z
 export const uploadLogoInputSchema = z
   .object({
     eventId: eventIdSchema,
-    dataUrl: z.string().max(1_500_000),
-    mimeType: z.enum(["image/png", "image/svg+xml"]),
+    dataUrl: z.string().max(16_000_000),
+    mimeType: z.enum(["image/png", "image/svg+xml", "image/jpeg", "image/webp"]),
+    append: z.boolean().optional(),
   })
   .strict();

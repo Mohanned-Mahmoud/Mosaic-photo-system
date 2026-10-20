@@ -2,7 +2,7 @@ import type { Express, Request, Response, NextFunction, RequestHandler } from "e
 import multer from "multer";
 import { consumeRateLimit } from "./rate-limit";
 import { z } from "zod";
-import { eventIdSchema, uuidSchema, DEFAULT_EVENT_SETTINGS } from "../../shared/mosaic";
+import { eventIdSchema, uuidSchema, DEFAULT_EVENT_SETTINGS, DEFAULT_BRANDING } from "../../shared/mosaic";
 import { storageGetSignedUrl, storagePut } from "../storage";
 import {
   getEventById,
@@ -13,10 +13,19 @@ import {
   recordBoothPresence,
   toPhotoPayload,
   getPhotoCount,
+  updateEvent,
+  toPublicEventDto,
 } from "./repository";
-import { addStreamClient, publishPhoto } from "./realtime";
+import { addStreamClient, publishPhoto, broadcast } from "./realtime";
 import { ACCEPTED_PHOTO_MIME_TYPES, hasValidImageSignature } from "./image-validation";
 import { PhotoProcessingError, processUploadedPhoto } from "./image-processing";
+import { decodeBase64DataUrl, sanitizeLogoSvg } from "./router";
+import sharp from "sharp";
+
+const logoUploadMulter = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 200_000_000, files: 1, fields: 5 },
+});
 
 const photoUpload = multer({
   storage: multer.memoryStorage(),
@@ -335,4 +344,145 @@ export function registerMosaicHttpRoutes(app: Express): void {
       if (!response.headersSent) response.status(502).json({ error: "Photo download is temporarily unavailable" });
     }
   }));
+
+  app.post(
+    "/api/events/:eventId/logo",
+    logoUploadMulter.single("file"),
+    asyncRoute(async (request, response) => {
+      const eventResult = eventIdSchema.safeParse(request.params.eventId);
+      if (!eventResult.success) {
+        response.status(400).json({ error: "Invalid event identifier" });
+        return;
+      }
+
+      const existingEvent = await getEventById(eventResult.data, true);
+      if (!existingEvent) {
+        response.status(404).json({ error: "Event not found" });
+        return;
+      }
+
+      const append = request.body?.append === "true" || request.body?.append === true;
+      let content: Buffer | string;
+      let contentType = "image/png";
+      let extension = "png";
+
+      if (request.file) {
+        const fileBuffer = request.file.buffer;
+        const originalMime = request.file.mimetype || "";
+        const originalName = request.file.originalname || "";
+
+        if (originalMime === "image/svg+xml" || originalName.toLowerCase().endsWith(".svg")) {
+          try {
+            content = sanitizeLogoSvg(fileBuffer);
+          } catch (err: unknown) {
+            response.status(400).json({ error: err instanceof Error ? err.message : "Invalid SVG content" });
+            return;
+          }
+          contentType = "image/svg+xml";
+          extension = "svg";
+        } else {
+          try {
+            let pipeline = sharp(fileBuffer, { limitInputPixels: false });
+            const metadata = await pipeline.metadata();
+
+            // Auto-orient based on EXIF
+            pipeline = pipeline.rotate();
+
+            // Resize down if width or height exceeds 2560px
+            if (metadata.width && metadata.height && (metadata.width > 2560 || metadata.height > 2560)) {
+              pipeline = pipeline.resize({
+                width: metadata.width >= metadata.height ? 2560 : undefined,
+                height: metadata.height > metadata.width ? 2560 : undefined,
+                fit: "inside",
+                withoutEnlargement: true,
+              });
+            }
+
+            const isPng = originalMime === "image/png" || originalName.toLowerCase().endsWith(".png") || Boolean(metadata.hasAlpha);
+            if (isPng) {
+              const pngBuf = await pipeline.png({ compressionLevel: 8 }).toBuffer();
+              if (pngBuf.length > 10_000_000) {
+                content = await pipeline.webp({ quality: 90, alphaQuality: 90 }).toBuffer();
+                contentType = "image/webp";
+                extension = "webp";
+              } else {
+                content = pngBuf;
+                contentType = "image/png";
+                extension = "png";
+              }
+            } else {
+              content = await pipeline.webp({ quality: 90 }).toBuffer();
+              contentType = "image/webp";
+              extension = "webp";
+            }
+          } catch (err: unknown) {
+            console.error("[Logo Upload Processing Error]", err);
+            response.status(400).json({ error: "تعذر معالجة أو فك ترميز ملف الصورة. يرجى التأكد من سلامة الملف." });
+            return;
+          }
+        }
+      } else {
+        const { dataUrl, mimeType } = request.body || {};
+        if (!dataUrl || !mimeType) {
+          response.status(400).json({ error: "Missing image data or file" });
+          return;
+        }
+
+        let bytes: Buffer;
+        try {
+          bytes = decodeBase64DataUrl(dataUrl, mimeType);
+        } catch (err: unknown) {
+          response.status(400).json({ error: err instanceof Error ? err.message : "Invalid image payload" });
+          return;
+        }
+
+        if (mimeType === "image/png" || mimeType === "image/jpeg" || mimeType === "image/webp") {
+          if (!hasValidImageSignature(mimeType, bytes)) {
+            response.status(400).json({ error: `The selected file is not a valid ${mimeType.split('/')[1]?.toUpperCase() || 'image'}` });
+            return;
+          }
+          extension = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/webp" ? "webp" : "png";
+          contentType = mimeType;
+          content = bytes;
+        } else {
+          try {
+            content = sanitizeLogoSvg(bytes);
+          } catch (err: unknown) {
+            response.status(400).json({ error: err instanceof Error ? err.message : "Invalid SVG content" });
+            return;
+          }
+          contentType = "image/svg+xml";
+          extension = "svg";
+        }
+      }
+
+      const logoId = Math.random().toString(36).substring(2, 9);
+      const stored = await storagePut(`events/${eventResult.data}/branding/target-${logoId}.${extension}`, content, contentType);
+
+      const currentBranding = existingEvent.branding || DEFAULT_BRANDING;
+      const currentTargets = currentBranding.targetLogos?.length
+        ? currentBranding.targetLogos
+        : (existingEvent.logoUrl ? [existingEvent.logoUrl] : []);
+
+      let nextTargets: string[];
+      if (append) {
+        nextTargets = [...currentTargets, stored.url];
+      } else {
+        nextTargets = currentTargets.length > 0 ? [stored.url, ...currentTargets.slice(1)] : [stored.url];
+      }
+
+      const updated = await updateEvent(eventResult.data, {
+        logoUrl: nextTargets[0],
+        branding: {
+          ...currentBranding,
+          targetLogos: nextTargets,
+        },
+      });
+
+      const publicDto = toPublicEventDto(updated);
+      broadcast(eventResult.data, "branding", { event: publicDto });
+      response.status(200).json({ success: true, event: publicDto, url: stored.url });
+    })
+  );
 }
+

@@ -1,26 +1,14 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { ENV } from "./_core/env";
+import fs from "fs";
+import path from "path";
 import crypto from "crypto";
+import { promisify } from "util";
 
-let _s3Client: S3Client | null = null;
+const writeFileAsync = promisify(fs.writeFile);
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(process.cwd(), "uploads");
 
-function getS3Client() {
-  if (!_s3Client) {
-    if (!ENV.s3EndpointUrl || !ENV.s3AccessKeyId || !ENV.s3SecretAccessKey) {
-      throw new Error("S3 config missing: check AWS_ENDPOINT_URL_S3, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY");
-    }
-    _s3Client = new S3Client({
-      region: ENV.s3Region,
-      endpoint: ENV.s3EndpointUrl,
-      credentials: {
-        accessKeyId: ENV.s3AccessKeyId,
-        secretAccessKey: ENV.s3SecretAccessKey,
-      },
-      forcePathStyle: true,
-    });
-  }
-  return _s3Client;
+// Ensure uploads directory exists
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
 function normalizeKey(relKey: string): string {
@@ -39,17 +27,16 @@ export async function storagePut(
   data: Buffer | Uint8Array | string,
   contentType = "application/octet-stream",
 ): Promise<{ key: string; url: string }> {
-  const client = getS3Client();
   const key = appendHashSuffix(normalizeKey(relKey));
+  const fullPath = path.join(UPLOADS_DIR, key);
+  
+  // Create any nested directories if needed
+  const dir = path.dirname(fullPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 
-  const command = new PutObjectCommand({
-    Bucket: ENV.s3Bucket,
-    Key: key,
-    ContentType: contentType,
-    Body: data,
-  });
-
-  await client.send(command);
+  await writeFileAsync(fullPath, data);
 
   return { key, url: `/local-storage/${key}` };
 }
@@ -60,14 +47,18 @@ export async function storageGet(relKey: string): Promise<{ key: string; url: st
 }
 
 export async function storageGetSignedUrl(relKey: string): Promise<string> {
-  const client = getS3Client();
   const key = normalizeKey(relKey);
+  return `/local-storage/${key}`;
+}
 
-  const command = new GetObjectCommand({
-    Bucket: ENV.s3Bucket,
-    Key: key,
-  });
-
-  const url = await getSignedUrl(client, command, { expiresIn: 3600 });
-  return url;
+export async function storageDelete(relKey: string): Promise<void> {
+  const key = normalizeKey(relKey);
+  const fullPath = path.join(UPLOADS_DIR, key);
+  try {
+    if (fs.existsSync(fullPath)) {
+      await fs.promises.unlink(fullPath);
+    }
+  } catch (err) {
+    console.error(`Failed to delete file: ${fullPath}`, err);
+  }
 }

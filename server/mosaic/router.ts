@@ -24,6 +24,8 @@ import {
   getPublicPhoto,
   hidePhoto,
   unhidePhoto,
+  deletePhoto,
+  deleteEvent,
   listGalleryPhotos,
   listPublicEvents,
   toPhotoPayload,
@@ -68,23 +70,26 @@ const publicGalleryLookup = publicReadProcedure("gallery", 180);
 const publicPhotoLookup = publicReadProcedure("photo", 120);
 const publicDashboardLookup = publicReadProcedure("dashboard", 120);
 
-function decodeBase64DataUrl(dataUrl: string, mimeType: "image/png" | "image/svg+xml"): Buffer {
+export function decodeBase64DataUrl(
+  dataUrl: string,
+  mimeType: "image/png" | "image/svg+xml" | "image/jpeg" | "image/webp",
+): Buffer {
   const prefix = `data:${mimeType};base64,`;
   if (!dataUrl.startsWith(prefix)) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid PNG or SVG logo" });
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid image file (PNG, SVG, JPG, WebP)" });
   }
   const encoded = dataUrl.slice(prefix.length);
   if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "Logo data is malformed" });
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Image data is malformed" });
   }
   const bytes = Buffer.from(encoded, "base64");
-  if (bytes.length === 0 || bytes.length > 1_000_000) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "Logo must be smaller than 1 MB" });
+  if (bytes.length === 0 || bytes.length > 12_000_000) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Image must be smaller than 12 MB" });
   }
   return bytes;
 }
 
-function sanitizeLogoSvg(input: Buffer): string {
+export function sanitizeLogoSvg(input: Buffer): string {
   const source = input.toString("utf8");
   if (
     !/^\s*<svg(?:\s|>)/i.test(source) ||
@@ -129,6 +134,7 @@ export const mosaicRouter = router({
     .input(updateEventInputSchema)
     .mutation(async ({ input }) => {
       await requireActiveEvent(input.eventId);
+      const existing = await getEventById(input.eventId);
       const { eventId, ...patch } = input;
       if (patch.settings?.maxPhotos) {
         const n = patch.settings.maxPhotos;
@@ -136,6 +142,29 @@ export const mosaicRouter = router({
         const cols = Math.ceil(n / Math.max(1, rows));
         patch.settings.maxPhotos = cols * Math.max(1, rows);
       }
+
+      if (patch.branding && existing) {
+        const existingTargets = existing.branding?.targetLogos?.length
+          ? existing.branding.targetLogos
+          : (existing.logoUrl ? [existing.logoUrl] : []);
+
+        const patchTargets = patch.branding.targetLogos;
+        const nextTargets = (patchTargets && patchTargets.length > 0)
+          ? patchTargets
+          : existingTargets;
+
+        patch.branding = {
+          ...existing.branding,
+          ...patch.branding,
+          targetLogos: nextTargets,
+          maskCorners: patch.branding.maskCorners ?? existing.branding?.maskCorners,
+        };
+
+        if (nextTargets[0]) {
+          (patch as { logoUrl?: string | null }).logoUrl = nextTargets[0];
+        }
+      }
+
       const event = toPublicEventDto(await updateEvent(eventId, patch));
       broadcast(eventId, "branding", { event });
       return event;
@@ -145,25 +174,46 @@ export const mosaicRouter = router({
     .input(uploadLogoInputSchema)
     .mutation(async ({ input }) => {
       await requireActiveEvent(input.eventId);
+      const existingEvent = await getEventById(input.eventId);
       const bytes = decodeBase64DataUrl(input.dataUrl, input.mimeType);
       let content: Buffer | string = bytes;
-      let contentType = input.mimeType;
+      let contentType: string = input.mimeType;
       let extension = "png";
 
-      if (input.mimeType === "image/png") {
+      if (input.mimeType === "image/png" || input.mimeType === "image/jpeg" || input.mimeType === "image/webp") {
         if (!hasValidImageSignature(input.mimeType, bytes)) {
-          throw new TRPCError({ code: "BAD_REQUEST", message: "The selected file is not a valid PNG" });
+          throw new TRPCError({ code: "BAD_REQUEST", message: `The selected file is not a valid ${input.mimeType.split('/')[1].toUpperCase()}` });
         }
+        extension = input.mimeType === "image/jpeg" ? "jpg" : input.mimeType === "image/webp" ? "webp" : "png";
       } else {
         content = sanitizeLogoSvg(bytes);
         contentType = "image/svg+xml";
         extension = "svg";
       }
 
-      const stored = await storagePut(`events/${input.eventId}/branding/logo.${extension}`, content, contentType);
-      const event = toPublicEventDto(await updateEvent(input.eventId, { logoUrl: stored.url }));
+      const logoId = Math.random().toString(36).substring(2, 9);
+      const stored = await storagePut(`events/${input.eventId}/branding/target-${logoId}.${extension}`, content, contentType);
+
+      const currentBranding = existingEvent?.branding || DEFAULT_BRANDING;
+      const currentTargets = currentBranding.targetLogos?.length
+        ? currentBranding.targetLogos
+        : (existingEvent?.logoUrl ? [existingEvent.logoUrl] : []);
+
+      let nextTargets: string[];
+      if (input.append) {
+        nextTargets = [...currentTargets, stored.url];
+      } else {
+        nextTargets = [stored.url, ...currentTargets.filter(u => u !== stored.url)];
+      }
+
+      const updatedBranding = { ...currentBranding, targetLogos: nextTargets };
+      const event = toPublicEventDto(await updateEvent(input.eventId, {
+        logoUrl: nextTargets[0] || stored.url,
+        branding: updatedBranding,
+      }));
+
       broadcast(input.eventId, "branding", { event });
-      return { logoUrl: stored.url };
+      return { logoUrl: stored.url, targetLogos: nextTargets };
     }),
 
   publicEvent: publicEventLookup
@@ -209,7 +259,7 @@ export const mosaicRouter = router({
     .input(eventControlInputSchema)
     .mutation(async ({ input }) => {
       await requireActiveEvent(input.eventId);
-      const control = await updateMosaicControl(input.eventId, input.action);
+      const control = await updateMosaicControl(input.eventId, input.action, { targetIndex: input.targetIndex });
       publishControl(input.eventId, control.revision, { ...control, action: input.action });
       return control;
     }),
@@ -235,5 +285,25 @@ export const mosaicRouter = router({
       // We don't necessarily need to broadcast unhide to the wall unless we want it to immediately re-enter.
       // Usually it'll just show up in the gallery again. If we want it on the wall, we could broadcast a 'photo' event.
       return { unhidden: true as const };
+    }),
+
+  deletePhoto: publicAdminMutation
+    .input(eventControlInputSchema.pick({ eventId: true }).extend({ photoId: uuidSchema }).strict())
+    .mutation(async ({ input }) => {
+      const { eventId, photoId } = input;
+      await requireActiveEvent(eventId);
+      const deleted = await deletePhoto(eventId, photoId);
+      if (!deleted) throw new TRPCError({ code: "NOT_FOUND", message: "Photo not found" });
+      broadcast(eventId, "photo-hidden", { photoId }, `hidden-${photoId}`);
+      return { deleted: true as const };
+    }),
+
+  deleteEvent: publicAdminMutation
+    .input(eventIdSchema)
+    .mutation(async ({ input }) => {
+      await requireActiveEvent(input);
+      const deleted = await deleteEvent(input);
+      if (!deleted) throw new TRPCError({ code: "NOT_FOUND", message: "Event not found" });
+      return { deleted: true as const };
     }),
 });

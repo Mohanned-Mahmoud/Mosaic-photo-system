@@ -110,9 +110,35 @@ export default function BoothPage() {
   const [cameraAttempt, setCameraAttempt] = useState(0);
   const [connection, setConnection] = useState<"connecting" | "online" | "reconnecting">("connecting");
   const [state, dispatch] = useReducer(boothReducer, initialBoothState);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const eventQuery = trpc.mosaic.publicEvent.useQuery(eventId ?? "invalid", {
     enabled: Boolean(eventId), retry: 1, refetchOnWindowFocus: false,
   });
+
+  const event = eventQuery.data;
+  const isLettersMode = event?.branding?.logoDisplayMode === "letters";
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const image = await preparePhoto(file);
+      const photo: CapturedPhoto = {
+        id: crypto.randomUUID(),
+        image,
+        localUrl: URL.createObjectURL(image.image),
+      };
+      currentPhotoRef.current = photo;
+      dispatch({ type: "CAPTURED", photo });
+    } catch (error: unknown) {
+      dispatch({
+        type: "CAPTURE_FAILED",
+        message: error instanceof Error ? error.message : "The photo could not be prepared. Please try again.",
+      });
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
 
   useEffect(() => {
     if (!eventId) return;
@@ -182,10 +208,11 @@ export default function BoothPage() {
       const context = canvas.getContext("2d", { alpha: false });
       if (!context) throw new Error("The camera image could not be captured on this device.");
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const captured = await new Promise<Blob>((resolve, reject) => {
+      const capturedBlob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("The camera image could not be captured.")), "image/jpeg", 0.94);
       });
-      const image = await preparePhoto(captured);
+
+      const image = await preparePhoto(capturedBlob);
       const photo: CapturedPhoto = {
         id: crypto.randomUUID(),
         image,
@@ -305,13 +332,20 @@ export default function BoothPage() {
     );
   }
 
-  const event = eventQuery.data;
-  const qrValue = `${window.location.origin}/gallery/${encodeURIComponent(event.id)}?photo=${encodeURIComponent(state.photo?.id ?? "")}`;
+  const qrValue = event ? `${window.location.origin}/gallery/${encodeURIComponent(event.id)}?photo=${encodeURIComponent(state.photo?.id ?? "")}` : "";
   const isPreview = state.stage === "preview" || state.stage === "uploading" || state.stage === "error";
 
   return (
     <main className={`booth-screen booth-screen--${state.stage}`}>
+      <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFileUpload} />
       <video ref={videoRef} className={`booth-camera${mirrorPreview ? " booth-camera--mirrored" : ""}`} autoPlay muted playsInline aria-label="Live camera preview" />
+      {isLettersMode && cameraState === "ready" && (state.stage === "ready" || state.stage === "countdown") && (
+        <div className="booth-letters-guide" aria-hidden="true">
+          <div className="booth-letters-guide__band">
+            <span>HAYAH SHARKS • POSITION FACE HERE</span>
+          </div>
+        </div>
+      )}
       <div className="booth-screen__shade" />
       <header className="booth-header">
         <MosaicWordmark compact />
@@ -328,9 +362,14 @@ export default function BoothPage() {
           <h1>{cameraState === "requesting" ? "One moment." : "Ready when you are."}</h1>
           <p>{cameraState === "requesting" ? "Allow camera access to begin." : cameraMessage}</p>
           {cameraState === "error" && (
-            <button className="button button--accent" type="button" onClick={() => setCameraAttempt(value => value + 1)}>
-              TRY CAMERA AGAIN
-            </button>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "center" }}>
+              <button className="button button--accent" type="button" onClick={() => setCameraAttempt(value => value + 1)}>
+                TRY CAMERA AGAIN
+              </button>
+              <button className="button button--quiet" type="button" onClick={() => fileInputRef.current?.click()}>
+                CHOOSE PHOTO FROM LIBRARY
+              </button>
+            </div>
           )}
         </section>
       )}
@@ -342,6 +381,14 @@ export default function BoothPage() {
           <button className="booth-shutter" type="button" onClick={() => dispatch({ type: "COUNTDOWN" })}>
             <span className="booth-shutter__icon"><ApertureMark /></span>
             <span>TAKE PHOTO</span>
+          </button>
+          <button
+            className="button button--quiet"
+            type="button"
+            style={{ marginTop: "0.5rem", fontSize: "0.85rem", opacity: 0.85 }}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            CHOOSE PHOTO FROM LIBRARY
           </button>
           <p className="booth-hint">Look into the camera. The wall is waiting.</p>
         </section>

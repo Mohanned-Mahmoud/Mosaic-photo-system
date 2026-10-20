@@ -15,12 +15,24 @@ import {
   type PublicEvent,
 } from "../../../../shared/mosaic";
 import MosaicWall from "./MosaicWall";
-import { appendUniquePhoto, getUnseenSnapshotPhotos } from "./mosaic-state";
+import { appendUniquePhoto, getUnseenSnapshotPhotos, getVisibleTileCapacity } from "./mosaic-state";
+import { downloadMosaicScreenshot } from "./mosaic-screenshot";
 
 const EMPTY_TILES = Array.from({ length: 500 }, (_, index) => index);
 
 const controlMessageSchema = mosaicControlSchema.extend({
-  action: z.enum(["play", "pause", "restart", "clear", "reset"]),
+  action: z.enum([
+    "play",
+    "pause",
+    "restart",
+    "clear",
+    "reset",
+    "toggle-fill",
+    "toggle-screensaver",
+    "next-target",
+    "prev-target",
+    "set-target",
+  ]),
 });
 const presenceSchema = z.object({ connectedBooths: z.number().int().nonnegative() });
 const hiddenMessageSchema = z.object({ photoId: z.string().uuid() });
@@ -57,9 +69,10 @@ export default function MosaicPage() {
     refetchOnWindowFocus: true,
     retry: 1,
   });
+  const controlMutation = trpc.mosaic.control.useMutation();
   const [event, setEvent] = useState<PublicEvent | null>(null);
   const [photos, setPhotos] = useState<PhotoPayload[]>([]);
-  const [control, setControl] = useState<MosaicControl>({ playing: true, revision: 0, restartKey: 0 });
+  const [control, setControl] = useState<MosaicControl>({ playing: true, revision: 0, restartKey: 0, autoFill: false, screensaver: false, targetIndex: 0 });
   const [connection, setConnection] = useState<"connecting" | "live" | "reconnecting">("connecting");
   const [connectedBooths, setConnectedBooths] = useState(0);
   const [opening, setOpening] = useState(true);
@@ -71,8 +84,11 @@ export default function MosaicPage() {
   const activeArrivalId = useRef<string | null>(null);
   const hasSnapshot = useRef(false);
   const priorRestartKey = useRef<number | null>(null);
+  const priorTargetIndex = useRef<number | null>(null);
   const lastSnapshotSignature = useRef("");
   const controlRef = useRef(control);
+  const autoAdvanceTimer = useRef<number | null>(null);
+  const hasTriggeredAdvanceFor = useRef<number | null>(null);
 
   useEffect(() => { controlRef.current = control; }, [control]);
 
@@ -131,9 +147,11 @@ export default function MosaicPage() {
     if (firstSnapshot) {
       hasSnapshot.current = true;
       priorRestartKey.current = next.control.restartKey;
+      priorTargetIndex.current = next.control.targetIndex;
       setOpening(true);
-    } else if (priorRestartKey.current !== next.control.restartKey) {
+    } else if (priorRestartKey.current !== next.control.restartKey || priorTargetIndex.current !== next.control.targetIndex) {
       priorRestartKey.current = next.control.restartKey;
+      priorTargetIndex.current = next.control.targetIndex;
       setOpening(true);
     }
   }, [eventId, finishArrival, startArrival]);
@@ -146,7 +164,7 @@ export default function MosaicPage() {
     if (!opening) return;
     const timer = window.setTimeout(() => setOpening(false), 4_200);
     return () => window.clearTimeout(timer);
-  }, [opening, control.restartKey]);
+  }, [opening, control.restartKey, control.targetIndex]);
 
   useEffect(() => {
     if (!event || opening || event.branding.logoAnimation === "none") return;
@@ -184,6 +202,12 @@ export default function MosaicPage() {
       if (!parsed.success || parsed.data.eventId !== eventId || seenIds.current.has(parsed.data.id)) return;
       seenIds.current.add(parsed.data.id);
       if (seenIds.current.size > 1_000) seenIds.current.delete(seenIds.current.values().next().value as string);
+
+      // If screensaver is active, do NOT display incoming photos on the wall!
+      if (controlRef.current.screensaver) {
+        return;
+      }
+
       setPhotos(current => appendUniquePhoto(current, parsed.data));
       startArrival(parsed.data.id);
     });
@@ -195,6 +219,7 @@ export default function MosaicPage() {
       const parsed = controlMessageSchema.safeParse(payload);
       if (!parsed.success) return;
       const { action, ...nextControl } = parsed.data;
+      const wasScreensaver = controlRef.current.screensaver;
       setControl(nextControl);
       controlRef.current = nextControl;
       if (action === "clear" || action === "reset") {
@@ -205,7 +230,12 @@ export default function MosaicPage() {
         activeArrival.current = false;
         seenIds.current.clear();
       }
-      if (action === "restart" || action === "reset") setOpening(true);
+      if (action === "restart" || action === "reset" || action === "next-target" || action === "prev-target" || action === "set-target") setOpening(true);
+
+      // If screensaver was turned off, refetch snapshot to catch up with all saved photos!
+      if (wasScreensaver && !nextControl.screensaver) {
+        void snapshotQuery.refetch();
+      }
     });
 
     source.addEventListener("photo-hidden", rawEvent => {
@@ -240,6 +270,165 @@ export default function MosaicPage() {
       source.close();
     };
   }, [eventId, applySnapshot, finishArrival, startArrival, snapshotQuery.data?.event.id]);
+
+  const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
+
+  const branding = event?.branding ?? EMPTY_BRANDING;
+  const isLettersMode = branding.logoDisplayMode === "letters";
+  const defaultLettersLogo = "/hayah-sharks-logo.png";
+  const fallbackLogo = isLettersMode ? defaultLettersLogo : defaultLogo;
+  const targetLogos: string[] = (branding.targetLogos && branding.targetLogos.length > 0)
+    ? branding.targetLogos
+    : (event?.logoUrl ? [event.logoUrl] : [fallbackLogo]);
+  const numTargets = Math.max(1, targetLogos.length);
+  const activeTargetIndex = (control.targetIndex ?? 0) % numTargets;
+  const currentLogoUrl = targetLogos[activeTargetIndex] || fallbackLogo;
+
+  const maxPhotos = event?.settings?.maxPhotos ?? 0;
+  const isMask = branding.logoDisplayMode === "mask" || branding.logoDisplayMode === "inverted-mask";
+  const boardCapacity = maxPhotos > 0
+    ? maxPhotos
+    : (isMask
+        ? 112
+        : (typeof window !== "undefined"
+            ? getVisibleTileCapacity(window.innerWidth, window.innerHeight, branding.tileGap, 0)
+            : 112));
+
+  // Partition photos per target board
+  let boardPhotos: PhotoPayload[];
+  if (isLettersMode || numTargets <= 1) {
+    // Mode 4 Letters always shows all event photos inside the letters
+    boardPhotos = photos;
+  } else {
+    const stageStart = activeTargetIndex * boardCapacity;
+    const stageEnd = stageStart + boardCapacity;
+    const stageSlice = photos.slice(stageStart, stageEnd);
+
+    if (stageSlice.length > 0) {
+      boardPhotos = stageSlice;
+    } else {
+      // If the current stage has no photos yet (e.g. operator switched to this target stage
+      // before total event photos reached stageStart, or testing stage transitions):
+      // NEVER leave the board empty or discard incoming photos!
+      // Fallback to all available event photos (or the latest photos up to boardCapacity)
+      boardPhotos = photos.slice(-boardCapacity);
+    }
+  }
+
+  // When autoFill is active and current target has no photos yet, repeat all available event photos
+  const effectiveWallPhotos = boardPhotos.length > 0
+    ? [...boardPhotos]
+    : (control.autoFill ? [...photos] : []);
+
+  // CRITICAL: Ensure arriving photo is ALWAYS present in the wall photos so the arrival
+  // animation immediately locates the target tile and never aborts or drops the photo!
+  if (arrivalId && !effectiveWallPhotos.some(p => p.id === arrivalId)) {
+    const arriving = photos.find(p => p.id === arrivalId);
+    if (arriving) {
+      effectiveWallPhotos.push(arriving);
+    }
+  }
+
+  // Auto-advance logic: when board fills up with actual photos, transition to next target logo
+  useEffect(() => {
+    hasTriggeredAdvanceFor.current = null;
+    if (autoAdvanceTimer.current) {
+      window.clearTimeout(autoAdvanceTimer.current);
+      autoAdvanceTimer.current = null;
+    }
+  }, [control.targetIndex]);
+
+  useEffect(() => {
+    if (!eventId || !event || numTargets <= 1 || branding.autoAdvance === false) return;
+    if (!control.playing || control.screensaver) {
+      if (autoAdvanceTimer.current) {
+        window.clearTimeout(autoAdvanceTimer.current);
+        autoAdvanceTimer.current = null;
+      }
+      return;
+    }
+
+    const isBoardFull = boardPhotos.length >= boardCapacity && boardCapacity > 0;
+    if (!isBoardFull) return;
+
+    if (hasTriggeredAdvanceFor.current === control.targetIndex) return;
+
+    // Only auto-advance if more photos have actually arrived to start the next stage,
+    // or if autoFill is active to showcase the boards.
+    const hasPhotosForNextStage = photos.length > (activeTargetIndex + 1) * boardCapacity;
+    if (!hasPhotosForNextStage && !control.autoFill) return;
+
+    const delayMs = hasPhotosForNextStage ? 350 : Math.max(1, branding.autoAdvanceDelay ?? 5) * 1000;
+
+    hasTriggeredAdvanceFor.current = control.targetIndex;
+    autoAdvanceTimer.current = window.setTimeout(() => {
+      const nextTarget = (control.targetIndex + 1) % numTargets;
+      controlMutation.mutate({
+        eventId,
+        action: "set-target",
+        targetIndex: nextTarget,
+      });
+    }, delayMs);
+
+    return () => {
+      if (autoAdvanceTimer.current) {
+        window.clearTimeout(autoAdvanceTimer.current);
+        autoAdvanceTimer.current = null;
+      }
+    };
+  }, [
+    boardPhotos.length,
+    boardCapacity,
+    photos.length,
+    activeTargetIndex,
+    control.targetIndex,
+    control.playing,
+    control.screensaver,
+    numTargets,
+    branding.autoAdvance,
+    branding.autoAdvanceDelay,
+    eventId,
+    event,
+    controlMutation,
+  ]);
+
+  const handleTakeScreenshot = useCallback(async () => {
+    if (!event || isCapturingScreenshot) return;
+    setIsCapturingScreenshot(true);
+    try {
+      const screenEl = document.querySelector<HTMLElement>(".mosaic-screen");
+      const rect = screenEl?.getBoundingClientRect();
+      const screenWidth = Math.round(rect?.width || (typeof window !== "undefined" ? window.innerWidth : 1920));
+      const screenHeight = Math.round(rect?.height || (typeof window !== "undefined" ? window.innerHeight : 1080));
+
+      await downloadMosaicScreenshot({
+        eventName: event.name,
+        photos: effectiveWallPhotos,
+        branding,
+        maxPhotos: event.settings?.maxPhotos ?? 0,
+        logoUrl: currentLogoUrl,
+        autoFill: control.autoFill,
+        stageIndex: activeTargetIndex,
+        totalStages: numTargets,
+        width: screenWidth,
+        height: screenHeight,
+      });
+    } catch (err) {
+      console.error("Screenshot capture failed:", err);
+    } finally {
+      setIsCapturingScreenshot(false);
+    }
+  }, [event, effectiveWallPhotos, branding, currentLogoUrl, control.autoFill, activeTargetIndex, numTargets, isCapturingScreenshot]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.key === "s" || e.key === "S") && !e.ctrlKey && !e.metaKey && !e.altKey && (e.target === document.body || e.target === document.documentElement)) {
+        void handleTakeScreenshot();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleTakeScreenshot]);
 
   if (!eventId) {
     return (
@@ -281,55 +470,97 @@ export default function MosaicPage() {
     return <main className="mosaic-screen"><div className="mosaic-loading"><MosaicWordmark /><span>CONNECTING TO THE WALL</span></div></main>;
   }
 
-  const branding = event?.branding ?? EMPTY_BRANDING;
-  const animationDuration = branding.animationSpeed === "calm" ? "2s" : branding.animationSpeed === "energetic" ? ".95s" : "1.45s";
+  const flightTime = branding.animationSpeed === "calm" ? 1.4 : branding.animationSpeed === "energetic" ? 0.8 : 1.1;
+  const holdSeconds = typeof branding.arrivalHoldDuration === "number" && branding.arrivalHoldDuration > 0
+    ? branding.arrivalHoldDuration
+    : (branding.animationSpeed === "calm" ? 3.5 : branding.animationSpeed === "energetic" ? 1.5 : 2.5);
+
   const screenStyle = {
     "--event-bg": branding.backgroundColor,
     "--event-primary": branding.primaryColor,
     "--event-accent": branding.accentColor,
     "--logo-scale": `${branding.logoScale}%`,
-    "--watermark-url": `url('${event?.logoUrl || defaultLogo}')`,
-    "--watermark-opacity": (branding.watermarkOpacity ?? 60) / 100,
-    "--watermark-blend": branding.watermarkBlendMode ?? "overlay",
+    "--inverted-logo-size": `${branding.logoScale || 48}%`,
+    "--letters-logo-size": `${branding.logoScale || 85}%`,
+    "--watermark-url": `url('${currentLogoUrl}')`,
+    "--watermark-opacity": (branding.watermarkOpacity ?? (isLettersMode ? 100 : 60)) / 100,
+    "--watermark-blend": branding.watermarkBlendMode ?? (isLettersMode ? "normal" : "overlay"),
     "--watermark-scale": `${branding.watermarkScale ?? 72}vmin`,
     "--watermark-position": (branding.watermarkPosition ?? "center").replace("-", " "),
-    "--arrival-duration": animationDuration,
+    "--arrival-hold-duration": `${holdSeconds}s`,
+    "--arrival-flight-duration": `${flightTime}s`,
   } as CSSProperties;
 
   return (
     <main className="mosaic-screen" data-theme={branding.theme} style={screenStyle}>
       {event ? (
         <MosaicWall
-          photos={photos}
+          photos={effectiveWallPhotos}
           arrivalId={arrivalId}
           animate={control.playing}
+          autoFill={control.autoFill}
           branding={branding}
           maxPhotos={event.settings?.maxPhotos ?? 0}
-          logoUrl={event.logoUrl || defaultLogo}
+          logoUrl={currentLogoUrl}
           onArrivalEnd={finishArrival}
         />
       ) : (
         <div className="mosaic-empty-grid" aria-hidden="true">{EMPTY_TILES.map(index => <span key={index} />)}</div>
       )}
 
+      {control.screensaver && (
+        <div className="mosaic-screen__screensaver-badge" aria-label="Wall is frozen">
+          <span className="screensaver-dot" />
+          <span>SCREENSAVER ACTIVE / تثبيت الشاشة</span>
+        </div>
+      )}
 
+      {numTargets > 1 && (
+        <div className="mosaic-stage-indicator" aria-label={`Stage ${activeTargetIndex + 1} of ${numTargets}`}>
+          <span>STAGE {activeTargetIndex + 1} / {numTargets}</span>
+          <div className="mosaic-stage-indicator__dots">
+            {targetLogos.map((_, idx) => (
+              <span
+                key={idx}
+                className={`mosaic-stage-dot ${idx === activeTargetIndex ? "mosaic-stage-dot--active" : idx < activeTargetIndex ? "mosaic-stage-dot--done" : ""}`}
+                title={`Stage ${idx + 1}`}
+              />
+            ))}
+          </div>
+        </div>
+      )}
 
       {event && (
         <div className={`mosaic-intro mosaic-intro--${branding.logoPosition}${branding.logoAnimation === "none" ? " mosaic-intro--none" : ""}${opening || ambientReveal ? " is-visible" : ""}${ambientReveal ? " mosaic-intro--ambient" : ""}`} aria-hidden={!opening && !ambientReveal}>
           <div className="mosaic-intro__mark">
-            {event.logoUrl ? <img src={event.logoUrl} alt="" /> : <MosaicWordmark />}
+            {currentLogoUrl ? <img src={currentLogoUrl} alt="" /> : <MosaicWordmark />}
           </div>
           <h1>{event.name}</h1>
-          <p>EVERY MOMENT BECOMES PART OF THE ROOM</p>
+          <p>{numTargets > 1 ? `STAGE ${activeTargetIndex + 1} OF ${numTargets}` : "EVERY MOMENT BECOMES PART OF THE ROOM"}</p>
         </div>
       )}
 
-      {event && photos.length > 0 && (
+      {event && (
         <div className="mosaic-screen__caption" aria-live="polite">
-          <span>{event.name}</span>
-          <span>{photos.length} {photos.length === 1 ? "MOMENT" : "MOMENTS"}</span>
+          <span>{event.name} {numTargets > 1 ? `• TARGET ${activeTargetIndex + 1}/${numTargets}` : ""}</span>
+          <span>{boardPhotos.length} {boardPhotos.length === 1 ? "MOMENT" : "MOMENTS"}{boardCapacity > 0 ? ` / ${boardCapacity}` : ""}</span>
         </div>
       )}
+
+      {event && (
+        <button
+          type="button"
+          className="mosaic-screenshot-btn"
+          onClick={() => void handleTakeScreenshot()}
+          disabled={isCapturingScreenshot}
+          title="Download Wall Screenshot (Press 'S')"
+          aria-label="Download Wall Screenshot"
+        >
+          <span>📸</span>
+          <span>{isCapturingScreenshot ? "SAVING…" : "SCREENSHOT"}</span>
+        </button>
+      )}
+
       {!event && connection === "reconnecting" && (
         <div className="mosaic-loading"><MosaicWordmark /><span>CONNECTING TO THE WALL</span></div>
       )}

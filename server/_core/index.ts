@@ -5,13 +5,13 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerMosaicHttpRoutes } from "../mosaic/http";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
-import { serveStatic, setupVite } from "./vite";
+import { serveStatic } from "./serveStatic";
 import { registerStorageProxy } from "./storageProxy";
 
 export async function createApp() {
   const app = express();
-  app.use(express.json({ limit: "2mb" }));
-  app.use(express.urlencoded({ limit: "2mb", extended: true }));
+  app.use(express.json({ limit: "25mb" }));
+  app.use(express.urlencoded({ limit: "25mb", extended: true }));
   app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
   
   registerStorageProxy(app);
@@ -34,7 +34,13 @@ async function startServer() {
   const server = createServer(app);
 
   if (process.env.NODE_ENV !== "production") {
-    await setupVite(app, server);
+    try {
+      const viteModulePath = "./vite";
+      const { setupVite } = await import(viteModulePath);
+      await setupVite(app, server);
+    } catch {
+      serveStatic(app);
+    }
   } else {
     serveStatic(app);
   }

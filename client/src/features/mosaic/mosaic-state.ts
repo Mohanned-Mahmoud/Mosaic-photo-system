@@ -1,12 +1,13 @@
 import type { PhotoPayload } from "../../../../shared/mosaic";
 
-export const MAX_WALL_PHOTOS = 320;
+export const MAX_WALL_PHOTOS = 2000;
 
 export function getVisibleTileCapacity(viewportWidth: number, viewportHeight: number, tileGap = 4, maxPhotos = 0): number {
   if (maxPhotos > 0) {
-    const rows = Math.round(Math.sqrt(maxPhotos * 9/16));
-    const cols = Math.ceil(maxPhotos / Math.max(1, rows));
-    return cols * Math.max(1, rows);
+    const aspectRatio = (viewportWidth > 0 && viewportHeight > 0) ? viewportWidth / viewportHeight : 16 / 9;
+    const rows = Math.max(1, Math.round(Math.sqrt(maxPhotos / aspectRatio)));
+    const cols = Math.max(1, Math.ceil(maxPhotos / rows));
+    return cols * rows;
   }
   const width = Math.max(1, viewportWidth);
   const height = Math.max(1, viewportHeight);

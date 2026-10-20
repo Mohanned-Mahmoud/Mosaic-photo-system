@@ -1,81 +1,63 @@
-import { index, integer, json, pgEnum, pgTable, text, timestamp, varchar, boolean, serial } from "drizzle-orm/pg-core";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 import type { EventBranding, EventSettings } from "../shared/mosaic";
 
-export const roleEnum = pgEnum("role", ["user", "admin"]);
-
-/** Manus OAuth users. The starter's identity and role behavior remain unchanged. */
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  openId: varchar("openId", { length: 64 }).notNull().unique(),
+export const users = sqliteTable("users", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  openId: text("openId").notNull().unique(),
   name: text("name"),
-  email: varchar("email", { length: 320 }),
-  loginMethod: varchar("loginMethod", { length: 64 }),
-  role: roleEnum("role").default("user").notNull(),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().$onUpdateFn(() => new Date()).notNull(),
-  lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
+  email: text("email"),
+  loginMethod: text("loginMethod"),
+  role: text("role").default("user").notNull(),
+  createdAt: integer("createdAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+  updatedAt: integer("updatedAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+  lastSignedIn: integer("lastSignedIn", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
 });
 
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 
-/** Publicly managed event data; the nullable creator field only preserves legacy records. */
-export const events = pgTable(
-  "events",
-  {
-    id: varchar("id", { length: 32 }).primaryKey(),
-    ownerOpenId: varchar("ownerOpenId", { length: 64 }),
-    name: varchar("name", { length: 100 }).notNull(),
-    logoUrl: text("logoUrl"),
-    branding: json("branding").$type<EventBranding>().notNull(),
-    settings: json("settings").$type<EventSettings>().notNull(),
-    isActive: boolean("isActive").default(true).notNull(),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().$onUpdateFn(() => new Date()).notNull(),
-  },
-  table => [index("events_owner_openId_idx").on(table.ownerOpenId)],
-);
+export const events = sqliteTable("events", {
+  id: text("id").primaryKey(),
+  ownerOpenId: text("ownerOpenId"),
+  name: text("name").notNull(),
+  logoUrl: text("logoUrl"),
+  branding: text("branding", { mode: "json" }).$type<EventBranding>().notNull(),
+  settings: text("settings", { mode: "json" }).$type<EventSettings>().notNull(),
+  isActive: integer("isActive", { mode: "boolean" }).default(true).notNull(),
+  createdAt: integer("createdAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+  updatedAt: integer("updatedAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+});
 
-/** Booth presence is indexed per event; no user credential is stored on the booth. */
-export const booths = pgTable(
-  "booths",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    eventId: varchar("eventId", { length: 32 }).notNull(),
-    label: varchar("label", { length: 80 }),
-    lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-  },
-  table => [index("booths_event_idx").on(table.eventId), index("booths_last_seen_idx").on(table.eventId, table.lastSeenAt)],
-);
+export const booths = sqliteTable("booths", {
+  id: text("id").primaryKey(),
+  eventId: text("eventId").notNull(),
+  label: text("label"),
+  lastSeenAt: integer("lastSeenAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+  createdAt: integer("createdAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+});
 
-/** Image bytes are in managed object storage; this table holds references and moderation state. */
-export const photos = pgTable(
-  "photos",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    eventId: varchar("eventId", { length: 32 }).notNull(),
-    boothId: varchar("boothId", { length: 36 }).notNull(),
-    imageUrl: text("imageUrl").notNull(),
-    thumbnailUrl: text("thumbnailUrl").notNull(),
-    mosaicVisible: boolean("mosaicVisible").default(true).notNull(),
-    hiddenAt: timestamp("hiddenAt"),
-    createdAt: timestamp("createdAt").defaultNow().notNull(),
-  },
-  table => [
-    index("photos_event_created_idx").on(table.eventId, table.createdAt),
-    index("photos_event_mosaic_idx").on(table.eventId, table.mosaicVisible, table.createdAt),
-    index("photos_event_hidden_idx").on(table.eventId, table.hiddenAt, table.createdAt),
-  ],
-);
+export const photos = sqliteTable("photos", {
+  id: text("id").primaryKey(),
+  eventId: text("eventId").notNull(),
+  boothId: text("boothId").notNull(),
+  imageUrl: text("imageUrl").notNull(),
+  thumbnailUrl: text("thumbnailUrl").notNull(),
+  mosaicVisible: integer("mosaicVisible", { mode: "boolean" }).default(true).notNull(),
+  hiddenAt: integer("hiddenAt", { mode: "timestamp" }),
+  createdAt: integer("createdAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
+});
 
-/** Per-event persisted operator intent; restartKey replays the branded opening without deleting data. */
-export const mosaicStates = pgTable("mosaicStates", {
-    eventId: varchar("eventId", { length: 32 }).primaryKey(),
-    playing: boolean("playing").default(true).notNull(),
+export const mosaicStates = sqliteTable("mosaicStates", {
+    eventId: text("eventId").primaryKey(),
+    playing: integer("playing", { mode: "boolean" }).default(true).notNull(),
     revision: integer("revision").default(0).notNull(),
     restartKey: integer("restartKey").default(0).notNull(),
-    updatedAt: timestamp("updatedAt").defaultNow().$onUpdateFn(() => new Date()).notNull(),
+    autoFill: integer("autoFill", { mode: "boolean" }).default(false).notNull(),
+    screensaver: integer("screensaver", { mode: "boolean" }).default(false).notNull(),
+    frozenPhotoCount: integer("frozenPhotoCount").default(0).notNull(),
+    targetIndex: integer("targetIndex").default(0).notNull(),
+    updatedAt: integer("updatedAt", { mode: "timestamp" }).default(sql`(strftime('%s', 'now'))`).notNull(),
 });
 
 export type EventRecord = typeof events.$inferSelect;

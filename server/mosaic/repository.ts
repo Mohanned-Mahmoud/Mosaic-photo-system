@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gt, isNull, isNotNull, lt, or } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull, isNotNull, lt, or, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { booths, events, mosaicStates, photos, type EventRecord, type PhotoRecord } from "../../drizzle/schema";
 import {
@@ -9,13 +9,25 @@ import {
   type PublicEvent,
 } from "../../shared/mosaic";
 import { getDb } from "../db";
+import { storageDelete } from "../storage";
 
 const WALL_PHOTO_LIMIT = 320;
 const GALLERY_PAGE_SIZE = 36;
 
+let migratedControlCols = false;
+async function ensureMosaicControlColumns(db: any) {
+  if (migratedControlCols) return;
+  migratedControlCols = true;
+  try { await db.run(sql`ALTER TABLE mosaicStates ADD COLUMN autoFill INTEGER DEFAULT 0 NOT NULL`); } catch {}
+  try { await db.run(sql`ALTER TABLE mosaicStates ADD COLUMN screensaver INTEGER DEFAULT 0 NOT NULL`); } catch {}
+  try { await db.run(sql`ALTER TABLE mosaicStates ADD COLUMN frozenPhotoCount INTEGER DEFAULT 0 NOT NULL`); } catch {}
+  try { await db.run(sql`ALTER TABLE mosaicStates ADD COLUMN targetIndex INTEGER DEFAULT 0 NOT NULL`); } catch {}
+}
+
 async function database() {
   const db = await getDb();
   if (!db) throw new Error("Database is not available");
+  await ensureMosaicControlColumns(db);
   return db;
 }
 
@@ -73,7 +85,7 @@ export async function createEvent(name: string): Promise<EventRecord> {
       settings: DEFAULT_EVENT_SETTINGS,
       isActive: true,
     }),
-    db.insert(mosaicStates).values({ eventId: id, playing: true, revision: 0, restartKey: 0 })
+    db.insert(mosaicStates).values({ eventId: id, playing: true, revision: 0, restartKey: 0, autoFill: false, screensaver: false, frozenPhotoCount: 0, targetIndex: 0 })
   ]);
   const event = await getEventById(id);
   if (!event) throw new Error("Created event could not be read back");
@@ -93,7 +105,7 @@ export async function updateEvent(
 
 async function ensureControl(eventId: string): Promise<void> {
   const db = await database();
-  await db.insert(mosaicStates).values({ eventId, playing: true, revision: 0, restartKey: 0 }).onConflictDoUpdate({
+  await db.insert(mosaicStates).values({ eventId, playing: true, revision: 0, restartKey: 0, autoFill: false, screensaver: false, frozenPhotoCount: 0, targetIndex: 0 }).onConflictDoUpdate({
     target: mosaicStates.eventId,
     set: { eventId },
   });
@@ -108,7 +120,14 @@ export async function getMosaicControl(eventId: string): Promise<MosaicControl> 
   }
   const control = rows[0];
   if (!control) throw new Error("Mosaic state is not available");
-  return { playing: control.playing, revision: control.revision, restartKey: control.restartKey };
+  return {
+    playing: control.playing,
+    revision: control.revision,
+    restartKey: control.restartKey,
+    autoFill: Boolean(control.autoFill),
+    screensaver: Boolean(control.screensaver),
+    targetIndex: Number(control.targetIndex ?? 0),
+  };
 }
 
 export async function getMosaicSnapshot(eventId: string) {
@@ -120,13 +139,22 @@ export async function getMosaicSnapshot(eventId: string) {
     countConnectedBooths(eventId),
     (async () => {
       const db = await database();
+      const stateRow = await db.select().from(mosaicStates).where(eq(mosaicStates.eventId, eventId)).limit(1);
+      const isScreensaver = Boolean(stateRow[0]?.screensaver);
+      const frozenCount = stateRow[0]?.frozenPhotoCount ?? 0;
+
       const rows = await db
         .select()
         .from(photos)
         .where(and(eq(photos.eventId, eventId), eq(photos.mosaicVisible, true), isNull(photos.hiddenAt)))
         .orderBy(desc(photos.createdAt), desc(photos.id))
         .limit(WALL_PHOTO_LIMIT);
-      return rows.reverse();
+
+      const chronological = rows.reverse();
+      if (isScreensaver && frozenCount > 0) {
+        return chronological.slice(0, frozenCount);
+      }
+      return chronological;
     })(),
   ]);
 
@@ -295,17 +323,50 @@ export async function unhidePhoto(eventId: string, photoId: string): Promise<boo
   return Number((result as any).rowCount ?? 0) > 0;
 }
 
+export async function deletePhoto(eventId: string, photoId: string): Promise<boolean> {
+  const db = await database();
+  const photo = await getPhotoById(photoId, eventId);
+  if (!photo) return false;
+
+  await storageDelete(photo.imageUrl);
+  if (photo.thumbnailUrl) {
+    await storageDelete(photo.thumbnailUrl);
+  }
+
+  const result = await db.delete(photos).where(and(eq(photos.eventId, eventId), eq(photos.id, photoId)));
+  return Number((result as any).rowCount ?? 0) > 0;
+}
+
+export async function deleteEvent(eventId: string): Promise<boolean> {
+  const db = await database();
+  const eventPhotos = await db.select().from(photos).where(eq(photos.eventId, eventId));
+  
+  for (const p of eventPhotos) {
+    await storageDelete(p.imageUrl);
+    if (p.thumbnailUrl) {
+      await storageDelete(p.thumbnailUrl);
+    }
+  }
+
+  await db.delete(photos).where(eq(photos.eventId, eventId));
+  await db.delete(booths).where(eq(booths.eventId, eventId));
+  await db.delete(mosaicStates).where(eq(mosaicStates.eventId, eventId));
+  const result = await db.delete(events).where(eq(events.id, eventId));
+  
+  return Number((result as any).rowCount ?? 0) > 0;
+}
+
 export async function updateMosaicControl(
   eventId: string,
   action: MosaicControlAction,
+  options?: { targetIndex?: number },
 ): Promise<MosaicControl> {
   const db = await database();
   await ensureControl(eventId);
-  const rows = await db
-    .select()
-    .from(mosaicStates)
-    .where(eq(mosaicStates.eventId, eventId))
-    .limit(1);
+  const [rows, event] = await Promise.all([
+    db.select().from(mosaicStates).where(eq(mosaicStates.eventId, eventId)).limit(1),
+    getEventById(eventId),
+  ]);
   const current = rows[0];
   if (!current) throw new Error("Mosaic control state is unavailable");
 
@@ -316,10 +377,51 @@ export async function updateMosaicControl(
       .where(and(eq(photos.eventId, eventId), eq(photos.mosaicVisible, true), isNull(photos.hiddenAt)));
   }
 
-  const next = nextMosaicControlState(current, action);
+  const currentControl: MosaicControl = {
+    playing: current.playing,
+    revision: current.revision,
+    restartKey: current.restartKey,
+    autoFill: Boolean(current.autoFill),
+    screensaver: Boolean(current.screensaver),
+    targetIndex: Number(current.targetIndex ?? 0),
+  };
+
+  const targetLogos = event?.branding?.targetLogos?.length
+    ? event.branding.targetLogos
+    : (event?.logoUrl ? [event.logoUrl] : []);
+  const maxTargets = Math.max(1, targetLogos.length);
+
+  const next = nextMosaicControlState(currentControl, action, {
+    targetIndex: options?.targetIndex,
+    maxTargets,
+  });
+
+  let frozenPhotoCount = current.frozenPhotoCount ?? 0;
+  if (action === "toggle-screensaver") {
+    if (next.screensaver) {
+      // Activating screensaver: snapshot current visible photo count
+      const activeCount = await db
+        .select({ total: count() })
+        .from(photos)
+        .where(and(eq(photos.eventId, eventId), eq(photos.mosaicVisible, true), isNull(photos.hiddenAt)));
+      frozenPhotoCount = Number(activeCount[0]?.total ?? 0);
+    } else {
+      frozenPhotoCount = 0;
+    }
+  }
+
   await db
     .update(mosaicStates)
-    .set({ ...next, updatedAt: new Date() })
+    .set({
+      playing: next.playing,
+      revision: next.revision,
+      restartKey: next.restartKey,
+      autoFill: next.autoFill,
+      screensaver: next.screensaver,
+      frozenPhotoCount,
+      targetIndex: next.targetIndex,
+      updatedAt: new Date(),
+    })
     .where(eq(mosaicStates.eventId, eventId));
   return next;
 }
